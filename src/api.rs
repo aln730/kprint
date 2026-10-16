@@ -1,6 +1,7 @@
 use crate::app::AppState;
 use crate::auth::AuthenticatedUser;
 use actix_web::{
+    error::ErrorBadRequest,
     error::ErrorNotFound,
     error::PayloadError,
     http::StatusCode,
@@ -14,7 +15,6 @@ use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use std::{
     fmt::{Display, Formatter},
-    num::ParseIntError,
     str::FromStr,
 };
 use tokio_util::compat::TokioAsyncReadCompatExt;
@@ -29,7 +29,7 @@ struct SuccessReply {
 
 #[derive(Debug, Clone)]
 pub struct ParseRangeError {
-    error: ParseIntError,
+    error: String,
     bad_range: String,
 }
 
@@ -83,7 +83,7 @@ enum DuplexMode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 enum ColorMode {
-    Grayscale,
+    Monochrome,
     Color,
 }
 
@@ -100,8 +100,8 @@ struct PrintOptions {
 }
 
 fn parse_one_in_range(term: &str) -> Result<i32, ParseRangeError> {
-    term.parse().map_err(|error| ParseRangeError {
-        error,
+    term.parse::<i32>().map_err(|error| ParseRangeError {
+        error: error.to_string(),
         bad_range: term.to_string(),
     })
 }
@@ -109,7 +109,15 @@ fn parse_one_in_range(term: &str) -> Result<i32, ParseRangeError> {
 fn parse_range(range: &str) -> Result<(i32, i32), ParseRangeError> {
     let (start, end) = range.split_once('-').unwrap_or((range, range));
     log::debug!("Parsing a range between {start:?} and {end:?}");
-    Ok((parse_one_in_range(start)?, parse_one_in_range(end)?))
+    let (start, end) = (parse_one_in_range(start)?, parse_one_in_range(end)?);
+    // IPP pages start at 1 and a range can't run backwards
+    if start < 1 || end < start {
+        return Err(ParseRangeError {
+            error: "pages start at 1 and end must be >= start".to_string(),
+            bad_range: range.to_string(),
+        });
+    }
+    Ok((start, end))
 }
 
 #[post("/printers/{printer}/print")]
@@ -131,18 +139,16 @@ pub async fn print(
         }
     };
 
+    if !(1..100).contains(&options.copies) {
+        return Err(ErrorBadRequest("copies must be 1-100").into()); //DONT SPAM
+    }
+
     // Empty string is the same as all pages
     let mut page_ranges = if !options.pages.trim().is_empty() {
         options
             .pages
             .split(',')
             .map(|term| parse_range(term.trim()))
-            .filter(|entry| {
-                entry
-                    .as_ref()
-                    .map(|(start, end)| end > start)
-                    .unwrap_or(true)
-            })
             .collect::<Result<Vec<(i32, i32)>, ParseRangeError>>()?
     } else {
         vec![]
@@ -153,14 +159,22 @@ pub async fn print(
         .coalesce(|(prev_start, prev_end), (this_start, this_end)| {
             if prev_end >= this_start {
                 // Merge the two ranges if they have overlap
-                Ok((prev_start, this_end))
+                Ok((prev_start, prev_end.max(this_end)))
             } else {
                 Err(((prev_start, prev_end), (this_start, this_end)))
             }
         })
-        .map(|(min, max)| IppValue::RangeOfInteger { min, max })
-        .map(|range| IppAttribute::new("page-ranges", range))
-        .collect::<Vec<_>>();
+
+    .map(|(min,max)| IppValue::RangeOfInteger { min, max }).collect::<Vec<_>>();
+
+    let page_ranges = if page_ranges.is_empty() {
+        vec![]
+    } else {
+        vec![IppAttribute::new(
+            "page-ranges",
+            IppValue::Array(page_ranges),
+        )]
+    };
 
     log::debug!("Here's where we landed with panges: {page_ranges:?}");
 
@@ -208,7 +222,21 @@ pub async fn print(
         .build();
 
     log::debug!("Sending operation to printer!");
-    let response = printer.send(operation).await.map_err(anyhow::Error::from)?;
+
+    let response = printer.send(operation).await.map_err(|err| {
+        log::error!("IPP send failed!: {err:?}");
+        anyhow::Error::from(err)
+    })?;
+
+    if !response.header().status_code().is_success() {
+        log::error!("printer rejected job: {:?}", response.header());
+        return Err(anyhow::anyhow!(
+                "printer rejected job!: {}",
+                response.header().status_code()
+        )
+            .into());
+    }
+
     let attributes = response.attributes();
     let job_link = attributes
         .groups()
